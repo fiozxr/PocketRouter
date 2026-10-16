@@ -1,0 +1,63 @@
+package dev.pocketrouter.app
+
+import android.content.pm.PackageManager
+import rikka.shizuku.Shizuku
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.util.concurrent.TimeUnit
+
+/**
+ * Optional privileged command bridge. Shizuku uses a user-started ADB shell;
+ * root is detected only when the user explicitly taps the root test button.
+ * Commands passed to this class are intentionally restricted to app-authored
+ * diagnostic commands, never arbitrary text entered by the user.
+ */
+object PrivilegeBridge {
+    const val SHIZUKU_REQUEST_CODE = 4821
+
+    fun shizukuBinderAvailable(): Boolean = try { Shizuku.pingBinder() } catch (_: Throwable) { false }
+
+    fun shizukuPermissionGranted(): Boolean = try {
+        shizukuBinderAvailable() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+    } catch (_: Throwable) { false }
+
+    fun shizukuStatus(): String = when {
+        !shizukuBinderAvailable() -> "Shizuku not running. Start Shizuku using Wireless debugging or USB ADB."
+        !shizukuPermissionGranted() -> "Shizuku is running, but PocketRouter has not been granted permission."
+        else -> "Shizuku connected and permission granted."
+    }
+
+    fun requestShizukuPermission() {
+        if (shizukuBinderAvailable() && !shizukuPermissionGranted()) {
+            Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
+        }
+    }
+
+    fun runShizukuIdentity(): String {
+        check(shizukuBinderAvailable()) { "Shizuku is not running." }
+        check(shizukuPermissionGranted()) { "Grant PocketRouter permission in the Shizuku prompt first." }
+        val process = Shizuku.newProcess(arrayOf("sh", "-c", "id; echo --- ANDROID ---; getprop ro.build.version.release; getprop ro.build.version.sdk; echo --- ROUTES ---; ip route 2>&1; echo --- NEIGHBORS ---; ip neigh 2>&1; echo --- TETHERING ---; dumpsys tethering 2>&1 | head -n 60"), null, null)
+        return readProcess(process)
+    }
+
+    /** Requests su only after explicit user action; no settings are modified. */
+    fun runRootIdentity(): String {
+        val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id; echo --- ANDROID ---; getprop ro.build.version.release; getprop ro.build.version.sdk; echo --- ROUTES ---; ip route 2>&1; echo --- RULES ---; ip rule show 2>&1; echo --- NEIGHBORS ---; ip neigh 2>&1; echo --- ARP CACHE ---; cat /proc/net/arp 2>&1; echo --- FIREWALL FILTER ---; iptables -S 2>&1; echo --- FIREWALL NAT ---; iptables -t nat -S 2>&1; echo --- TETHERING ---; dumpsys tethering 2>&1 | head -n 100"))
+        return readProcess(process)
+    }
+
+    private fun readProcess(process: Process): String {
+        val completed = process.waitFor(8, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            throw IllegalStateException("Command timed out.")
+        }
+        val stdout = BufferedReader(InputStreamReader(process.inputStream)).use { it.readText() }.trim()
+        val stderr = BufferedReader(InputStreamReader(process.errorStream)).use { it.readText() }.trim()
+        return buildString {
+            append(if (stdout.isBlank()) "No output" else stdout)
+            if (stderr.isNotBlank()) append("\nError output: ").append(stderr)
+            append("\nExit code: ").append(process.exitValue())
+        }
+    }
+}
